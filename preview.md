@@ -116,8 +116,76 @@ Normalized internal schema = OpenAI chat-completion shape.
   - Logs `provider.attempt`, `provider.exhausted`, `provider.fatal`, `provider.missing`.
   - Verified: mocked openai always-Server, gemini OK → gemini serves after 3 openai attempts.
 
-## Cache pipeline (planned flow, not yet wired)
-per request: exact (Redis, ~1ms hash-match on (model+messages+temp)) → semantic (embed user msg, pgvector cosine search, threshold `SEMANTIC_CACHE_THRESHOLD` default 0.97) → provider (router with fallback order + tenacity retry). Write both `CachedResponse` row and `SemanticCacheEntry` on miss→success.
+## Cache + chat pipeline (Phases 8, 9, 10 — done)
+
+### app/cache/keys.py
+- `build_request_hash(req)` — SHA256 of canonical JSON over `{model, messages[{role,content}], temperature, top_p, max_tokens}`, `sort_keys=True`, separators=`(,`,`:)`. Returns 64-char hex.
+- `last_user_message(req)` — last `role="user"` message content, else None.
+
+### app/cache/exact.py (Redis)
+- `redis.asyncio` client, lazy global via `get_redis()`, `decode_responses=True`.
+- Key prefix `cache:exact:{hash}`.
+- `get(hash) -> NormalizedResponse | None` (json → pydantic).
+- `set(hash, response, ttl)` — `SETEX` with `CACHE_TTL_SECONDS`.
+
+### app/cache/semantic.py (pgvector)
+- `lookup(db, model, embedding, threshold) -> (NormalizedResponse, request_hash, distance) | None`
+  - `max_dist = 1 - threshold` (cosine distance; pgvector `<=>` via `embedding.cosine_distance(q)`).
+  - ORDER BY distance LIMIT 1 WHERE `model = :model`. Hit iff `distance <= max_dist`.
+  - Joins to `CachedResponse` by `request_hash` to retrieve response JSON.
+- `store(db, hash, req, response, embedding, ttl_seconds)`
+  - Idempotent `CachedResponse` insert on `request_hash` (skip if exists), always append `SemanticCacheEntry` row.
+  - `expires_at = now() + ttl`.
+  - Single commit per call.
+
+### app/providers/pricing.py
+`PROVIDER_PRICING: {"{provider}:{model}": (prompt_$/1k, completion_$/1k)}`.
+Seeded: openai(gpt-4o, gpt-4o-mini, gpt-3.5-turbo, text-embedding-3-small), gemini(1.5-flash, 1.5-pro, 2.0-flash).
+`estimate_cost(provider, model, pt, ct)` → 0.0 for unknown model.
+
+### app/metrics/prometheus.py (counters declared; `/metrics` exposes them in Phase 13)
+- `gateway_requests_total{endpoint,status,provider,cache_hit}`
+- `gateway_request_duration_seconds{endpoint}` (Histogram)
+- `gateway_tokens_total{provider,kind}`
+- `gateway_cost_usd_total{provider,api_key_prefix}`
+- `gateway_provider_errors_total{provider,error_type}`
+- `gateway_rate_limit_rejections_total{api_key_prefix}`
+- `gateway_cache_exact_hits_total` / `..._misses_total`
+- `gateway_cache_semantic_hits_total` / `..._misses_total`
+
+### app/ratelimit/sliding_window.py
+`check_and_consume(api_key)` — stub returning None (Phase 11 real impl).
+
+### app/deps.py
+`@lru_cache get_router()` → single `ProviderRouter()`. `@lru_cache get_embedder()` → single `OpenAIProvider()` used only for `embed()`.
+
+### app/api/v1/chat.py — `POST /v1/chat/completions`
+- Dep: `require_api_key`, `get_db`.
+- Request body: `NormalizedRequest` (FastAPI 422 on validation fail).
+- Flow:
+  1. bind `request_id` (uuid4 hex) contextvar, `t0 = perf_counter()`.
+  2. `check_and_consume(api_key)` (stub).
+  3. `request_hash = build_request_hash(req)`.
+  4. **Exact cache** → `exact_cache.get` → hit: `response`, `hit=exact`, increment `cache_exact_hits_total`; miss → `cache_exact_misses_total`.
+  5. **Semantic cache** (iff `SEMANTIC_CACHE_ENABLED` and exact miss and `last_user_message` present):
+     - embed via `get_embedder().embed([user_text], EMBEDDING_MODEL)` (OpenAI).
+     - embed errors: log `semantic.embed_failed`, skip to provider.
+     - `semantic_cache.lookup(db, model, embedding, SEMANTIC_CACHE_THRESHOLD)` → hit: `response`, `hit=semantic`, log distance; miss → miss counter.
+  6. **Provider** (if still no response): `get_router().complete(req)`.
+     - `ProviderError` → 502, write `UsageLog(status="error")`, increment `provider_errors_total{provider,error_type}` + `requests_total{status=error}`.
+     - Success → `exact_cache.set(hash, response, ttl)` (failure logged, not fatal) and, if semantic enabled + embedding present, `semantic_cache.store(...)` (failure logged, not fatal).
+  7. **Usage + metrics** (always on success):
+     - cache hit: `prompt=completion=0, cost=0.0` (accurate cost accounting — cache = free).
+     - cache miss: `response.usage.*` tokens, `estimate_cost(...)`.
+     - insert `UsageLog(status="success", cache_hit=hit)`.
+     - increment `tokens_total{provider,kind}` for both prompt+completion, `cost_usd_total{provider, api_key_prefix}`, `requests_total{status=success}`, observe `request_duration_seconds`.
+  8. Return OpenAI-shaped dict: `{id, object="chat.completion", created, model, provider, x_request_id, x_cache_hit, choices[], usage}`.
+
+### main.py
+`app.include_router(chat_router)` added. Routes: `/v1/chat/completions`, `/health`, `/metrics`, plus openapi/docs.
+
+### Cache-accounting decision
+Cache hits recorded with **zero** prompt/completion tokens and **zero** cost in `UsageLog` (reflects real spend). Compute "cost saved" in Phase 18 by multiplying cache-hit count × avg miss cost.
 
 ## Auth (Phase 6 — done)
 `Authorization: Bearer sk-gw-live-{32 chars}`.
@@ -186,9 +254,9 @@ PYTHONPATH=. .venv/Scripts/python.exe scripts/create_api_key.py --name "user" [-
 - [x] 5 DB layer + alembic initial migration (5 tables + pgvector + IVFFlat idx)
 - [x] 6 API key auth (argon2, Bearer, admin dep, CLI, 2 seeded keys)
 - [x] 7 Provider layer (openai, gemini, anthropic stub, router w/ retry+fallback)
-- [ ] 8 Exact cache (Redis)
-- [ ] 9 Semantic cache (pgvector)
-- [ ] 10 /v1/chat/completions
+- [x] 8 Exact cache (Redis SETEX, json-serialized NormalizedResponse)
+- [x] 9 Semantic cache (pgvector cosine_distance lookup + idempotent store)
+- [x] 10 /v1/chat/completions (auth→ratelimit stub→exact→semantic→router, UsageLog, metrics, OpenAI-shaped response)
 - [ ] 11 Rate limiting
 - [ ] 12 Celery worker + jobs
 - [ ] 13 Prometheus + Grafana

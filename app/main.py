@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
+from app.api.v1.chat import router as chat_router
 from app.config import get_settings
 from app.logging import configure_logging, get_logger
 
@@ -22,6 +23,9 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+
+app.include_router(chat_router)
 
 
 @app.get("/health")
