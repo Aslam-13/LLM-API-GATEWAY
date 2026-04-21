@@ -102,11 +102,38 @@ Relationships: ApiKey↔UsageLog, ApiKey↔Job, CachedResponse↔SemanticCacheEn
 - First migration: `bbcedf249985_initial_schema.py`. Hand-edits: `CREATE EXTENSION IF NOT EXISTS vector` at top of upgrade; IVFFlat index on `semantic_cache_entries.embedding` using `vector_cosine_ops` with lists=100; `import pgvector.sqlalchemy`; downgrade drops the index.
 - Commands: `alembic revision --autogenerate -m "msg"`, `alembic upgrade head`.
 
+## Providers (Phase 7 — done)
+Normalized internal schema = OpenAI chat-completion shape.
+
+- `app/providers/schemas.py` — `Message{role,content}` (role=`system|user|assistant`), `NormalizedRequest{model, messages, temperature?, max_tokens?, top_p?, user?}`, `Usage{prompt/completion/total_tokens}`, `Choice{index, message, finish_reason?}`, `NormalizedResponse{id, model, provider, choices[], usage}`.
+- `app/providers/base.py` — `BaseProvider(ABC)` with `name`, `complete(req) -> NormalizedResponse`, `embed(texts, model) -> list[list[float]]`. Exception hierarchy: `ProviderError` base; subclasses `ProviderRateLimitError`, `ProviderTimeoutError`, `ProviderBadRequestError`, `ProviderAuthError`, `ProviderServerError`, `ProviderDisabledError`. Each instance has `.provider` set by provider impl.
+- `app/providers/openai_provider.py` — uses `AsyncOpenAI(api_key=…)`. Maps `RateLimitError`→RateLimit, `APITimeoutError|APIConnectionError`→Timeout, `AuthenticationError`→Auth, `BadRequestError`→BadRequest, other `APIStatusError`→Server. `embed()` via `/v1/embeddings`.
+- `app/providers/gemini_provider.py` — `google.generativeai`. Converts messages: `system` roles merged into `system_instruction`; `assistant` → `model`. Sync SDK calls wrapped in `asyncio.to_thread`. Maps `google.api_core.exceptions`: `ResourceExhausted`→RateLimit, `DeadlineExceeded`→Timeout, `Unauthenticated|PermissionDenied`→Auth, `InvalidArgument`→BadRequest, other `GoogleAPIError`→Server. `id = f"gemini-{uuid}"`. Usage from `response.usage_metadata`. `embed()` loops items through `genai.embed_content`.
+- `app/providers/anthropic_provider.py` — stub; `complete`/`embed` raise `ProviderDisabledError`. Instantiated by router only when `ENABLE_ANTHROPIC=true`.
+- `app/providers/router.py` — `ProviderRouter(providers?, order?)`. Defaults: instantiates OpenAI + Gemini (+ Anthropic if enabled), `order = settings.fallback_providers` (`PROVIDER_FALLBACK_ORDER` csv, default `openai,gemini`).
+  - Retry (tenacity `AsyncRetrying`): `stop_after_attempt(PROVIDER_RETRY_ATTEMPTS + 1)`, `wait_exponential(multiplier=delay, min=delay, max=delay*8)`. Retries only `_RETRYABLE = (RateLimit, Timeout, Server)`. Fatal-no-retry-no-fallback: `_FATAL = (Auth, BadRequest, Disabled)` → break loop and raise.
+  - After retries exhaust on one provider, moves to next in order. Raises the last error if all fail.
+  - Logs `provider.attempt`, `provider.exhausted`, `provider.fatal`, `provider.missing`.
+  - Verified: mocked openai always-Server, gemini OK → gemini serves after 3 openai attempts.
+
 ## Cache pipeline (planned flow, not yet wired)
 per request: exact (Redis, ~1ms hash-match on (model+messages+temp)) → semantic (embed user msg, pgvector cosine search, threshold `SEMANTIC_CACHE_THRESHOLD` default 0.97) → provider (router with fallback order + tenacity retry). Write both `CachedResponse` row and `SemanticCacheEntry` on miss→success.
 
-## Auth (planned)
-`Authorization: Bearer sk-gw-live-{32}`. Key format: `sk-gw-live-{first6}…`; prefix stored plain for lookup, full key argon2-hashed. `require_api_key()` and `require_admin_key()` FastAPI dependencies. CLI: `scripts/create_api_key.py` prints plaintext once.
+## Auth (Phase 6 — done)
+`Authorization: Bearer sk-gw-live-{32 chars}`.
+
+- `app/auth/keys.py`
+  - `KEY_PREFIX = "sk-gw-live-"`, random = `secrets.token_urlsafe(32)[:32]`.
+  - `generate_key() -> GeneratedKey(plaintext, prefix, hash)`. `prefix` = first `len(KEY_PREFIX)+6` chars of plaintext (stored plain, unique-indexed). `hash` = argon2 via `passlib.CryptContext(schemes=["argon2"])`.
+  - `verify_key(plaintext, key_hash) -> bool` (catches all errors → False).
+  - `extract_prefix(plaintext)` returns None if not prefixed `sk-gw-live-`.
+  - `lookup_by_prefix(db, prefix)` → `ApiKey | None`.
+- `app/auth/middleware.py`
+  - `require_api_key(request, authorization, db)` FastAPI dep. 401 if header missing or non-Bearer. 403 if prefix invalid / not found / revoked / hash mismatch. On success: `request.state.api_key = api_key` and `structlog.contextvars.bind_contextvars(api_key_id=str(api_key.id))`.
+  - `require_admin_key(api_key = Depends(require_api_key))` → 403 if `not is_admin`.
+- `scripts/create_api_key.py` — argparse CLI `--name --email --admin`. Run with `PYTHONPATH=. .venv/Scripts/python.exe scripts/create_api_key.py …`. Prints plaintext once (unrecoverable).
+- Verified: 401 missing, 401 wrong scheme, 403 bad/revoked, 200 valid, 403 user→admin-only, 200 admin→admin-only.
+- Test note: FastAPI `TestClient` creates a new asyncio loop per request, clashing with the engine's asyncpg pool. Use `httpx.AsyncClient(transport=httpx.ASGITransport(app=a))` inside one `asyncio.run` for multi-request checks. (Address properly in Phase 16 via per-test engine fixture.)
 
 ## Rate limiting (planned)
 Redis sliding-window sorted set `ratelimit:{api_key_id}:{window}`, score=timestamp. Per-minute + per-day. Overrides from `rate_limit_overrides` JSON. Applied before cache check. 429 + `Retry-After`.
@@ -141,7 +168,14 @@ docker exec -it gateway-postgres psql -U gateway -d gateway
 .venv/Scripts/alembic.exe revision --autogenerate -m "msg"
 .venv/Scripts/alembic.exe upgrade head
 .venv/Scripts/alembic.exe downgrade -1
+
+# Keys (scripts need PYTHONPATH=.)
+PYTHONPATH=. .venv/Scripts/python.exe scripts/create_api_key.py --name "user" [--email x@y] [--admin]
 ```
+
+## Seeded keys (dev only — rotate before prod)
+- admin: `sk-gw-live-q5O6ES0VSCMOz14eLpHqgqxY1rT4py6y` (id `ad231763-04ae-44ef-9a10-1f0ae9930d6e`, email `dev@glacien.ai`)
+- user:  `sk-gw-live-XgoWz0UJEqJ-h24Rcc3L7xZvLqHoqBO7` (id `359c863d-2d2b-41b3-861b-a95ae5ddeb30`)
 
 ## Phase progress
 - [x] 0 prerequisites
@@ -150,8 +184,8 @@ docker exec -it gateway-postgres psql -U gateway -d gateway
 - [x] 3 docker-compose.dev.yml (pg+redis+rabbit)
 - [x] 4 FastAPI skeleton (config, logging, main, /health, /metrics stub)
 - [x] 5 DB layer + alembic initial migration (5 tables + pgvector + IVFFlat idx)
-- [ ] 6 API key auth
-- [ ] 7 Provider layer (openai, gemini, anthropic stub, router)
+- [x] 6 API key auth (argon2, Bearer, admin dep, CLI, 2 seeded keys)
+- [x] 7 Provider layer (openai, gemini, anthropic stub, router w/ retry+fallback)
 - [ ] 8 Exact cache (Redis)
 - [ ] 9 Semantic cache (pgvector)
 - [ ] 10 /v1/chat/completions
