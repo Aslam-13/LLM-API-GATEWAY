@@ -203,11 +203,45 @@ Cache hits recorded with **zero** prompt/completion tokens and **zero** cost in 
 - Verified: 401 missing, 401 wrong scheme, 403 bad/revoked, 200 valid, 403 user→admin-only, 200 admin→admin-only.
 - Test note: FastAPI `TestClient` creates a new asyncio loop per request, clashing with the engine's asyncpg pool. Use `httpx.AsyncClient(transport=httpx.ASGITransport(app=a))` inside one `asyncio.run` for multi-request checks. (Address properly in Phase 16 via per-test engine fixture.)
 
-## Rate limiting (planned)
-Redis sliding-window sorted set `ratelimit:{api_key_id}:{window}`, score=timestamp. Per-minute + per-day. Overrides from `rate_limit_overrides` JSON. Applied before cache check. 429 + `Retry-After`.
+## Rate limiting (Phase 11 — done)
+`app/ratelimit/sliding_window.py` — Redis-backed per-key sliding window.
 
-## Celery (planned)
-`app/worker/celery_app.py` with RabbitMQ broker + Redis result backend. Tasks: `batch_embeddings_task`. Windows dev: `celery … --pool=solo`. Prod linux: `--pool=prefork`.
+- Keys: `ratelimit:{api_key_id}:minute` and `ratelimit:{api_key_id}:day` (sorted sets, score=timestamp ms).
+- Flow per request: read both windows (drop entries older than window via `ZREMRANGEBYSCORE`, `ZCARD` for count), **gate first on both, then consume once** (single member added to both sets — correct 1-request = 1-slot accounting).
+- Limits: `RATE_LIMIT_REQUESTS_PER_MINUTE` (60) and `RATE_LIMIT_REQUESTS_PER_DAY` (10000). Overrides from `ApiKey.rate_limit_overrides` JSON: `{"per_minute": int, "per_day": int}`.
+- Limit=0 disables the window.
+- 429 response with `Retry-After` header (60 / 86400). Increments `gateway_rate_limit_rejections_total{api_key_prefix}`.
+- Applied from chat + embeddings endpoints; cache hits still count (honest accounting).
+
+## Celery (Phase 12 — done)
+`app/worker/celery_app.py`
+
+- `Celery("gateway", broker=CELERY_BROKER_URL, backend=CELERY_RESULT_BACKEND)` with `include=["app.worker.tasks"]`.
+- JSON-only serialization. `task_acks_late=True`, `worker_prefetch_multiplier=1` (fairness for long tasks), `broker_connection_retry_on_startup=True`.
+
+`app/worker/tasks.py`
+
+- `@celery_app.task(name="batch_embeddings")` → `batch_embeddings_task(job_id, provider, model, texts)`.
+- Sync Celery task wraps `asyncio.run(_run_batch_embeddings(...))` and disposes the async engine on exit (per-worker-task loop hygiene).
+- `_run_batch_embeddings` uses `AsyncSessionLocal`: fetches `Job`, marks `running` + `started_at`, batches through provider `embed()` (`OPENAI_BATCH=512`, `GEMINI_BATCH=32`), stores `result={model, provider, count, dimensions, vectors}`, sets `succeeded` or `failed` + `error`, sets `finished_at`. One commit per state change.
+
+`app/api/v1/embeddings.py`
+
+- `POST /v1/embeddings` (sync). Body: `{model?, input: str | list[str]}`. 400 if `>100` inputs. Runs `get_embedder().embed(...)` directly. Returns OpenAI-shaped `{object:"list", model, data:[{object:"embedding", index, embedding}]}`. `ProviderError` → 502.
+- `POST /v1/embeddings/batch` (202). Body: `{model?, input: list[str], provider: "gemini"|"openai"}`. Inserts a `Job(kind=batch_embeddings, status=pending, input={model,provider,count})`, commits, calls `batch_embeddings_task.delay(...)`, returns `{job_id, status}`.
+
+`app/api/v1/jobs.py`
+
+- `GET /v1/jobs/{job_id}?include_result=true`. Auth: owner or admin (else 403). 404 if missing. Returns id, kind, status, input, result, error, created/started/finished timestamps.
+
+### Run the worker (Windows dev)
+```
+PYTHONPATH=. .venv/Scripts/celery.exe -A app.worker.celery_app worker -l info --pool=solo
+```
+Prod linux: `--pool=prefork` (or `--pool=gevent` for I/O-bound).
+
+### Routes now mounted
+`/v1/chat/completions`, `/v1/embeddings`, `/v1/embeddings/batch`, `/v1/jobs/{job_id}`, `/health`, `/metrics`.
 
 ## Prometheus (planned)
 Counters: `gateway_requests_total{endpoint,status,provider,cache_hit}`, `gateway_tokens_total{provider,kind}`, `gateway_cost_usd_total{provider,api_key_prefix}`, `gateway_provider_errors_total`, `gateway_rate_limit_rejections_total`, `gateway_cache_exact_hits_total/misses_total`. Histogram: `gateway_request_duration_seconds`.
@@ -259,8 +293,8 @@ PYTHONPATH=. .venv/Scripts/python.exe scripts/create_api_key.py --name "user" [-
 - [x] 8 Exact cache (Redis SETEX, json-serialized NormalizedResponse)
 - [x] 9 Semantic cache (pgvector cosine_distance lookup + idempotent store)
 - [x] 10 /v1/chat/completions (auth→ratelimit stub→exact→semantic→router, UsageLog, metrics, OpenAI-shaped response)
-- [ ] 11 Rate limiting
-- [ ] 12 Celery worker + jobs
+- [x] 11 Rate limiting (Redis sliding-window, per-minute + per-day, overrides)
+- [x] 12 Celery worker + jobs (batch_embeddings task, sync `/v1/embeddings`, async `/v1/embeddings/batch`, `/v1/jobs/{id}`)
 - [ ] 13 Prometheus + Grafana
 - [ ] 14 Dashboard (React+Vite)
 - [ ] 15 Nginx + prod Dockerfile + prod compose

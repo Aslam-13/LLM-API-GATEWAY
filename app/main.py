@@ -4,6 +4,8 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
 from app.api.v1.chat import router as chat_router
+from app.api.v1.embeddings import router as embeddings_router
+from app.api.v1.jobs import router as jobs_router
 from app.config import get_settings
 from app.logging import configure_logging, get_logger
 
@@ -26,6 +28,8 @@ app = FastAPI(
 
 
 app.include_router(chat_router)
+app.include_router(embeddings_router)
+app.include_router(jobs_router)
 
 
 @app.get("/health")
