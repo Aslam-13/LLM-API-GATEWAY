@@ -63,8 +63,8 @@ async def chat_completions(
             try:
                 vectors = await embedder.embed([user_text], settings.embedding_model)
                 embedding = vectors[0] if vectors else None
-            except ProviderError as e:
-                log.warning("semantic.embed_failed", error=str(e))
+            except Exception as e:
+                log.warning("semantic.embed_failed", error=str(e), error_type=type(e).__name__)
                 embedding = None
             if embedding is not None:
                 hit = await semantic_cache.lookup(

@@ -84,7 +84,12 @@ class GeminiProvider(BaseProvider):
         try:
             out: list[list[float]] = []
             for t in texts:
-                r = await asyncio.to_thread(genai.embed_content, model=model, content=t)
+                r = await asyncio.to_thread(
+                    genai.embed_content,
+                    model=model,
+                    content=t,
+                    output_dimensionality=768,
+                )
                 out.append(r["embedding"])
             return out
         except gexc.ResourceExhausted as e:

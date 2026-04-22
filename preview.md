@@ -62,7 +62,7 @@ CELERY_BROKER_URL=amqp://guest:guest@localhost:5672//
 CELERY_RESULT_BACKEND=redis://localhost:6379/1
 OPENAI_API_KEY=…  GEMINI_API_KEY=…  ANTHROPIC_API_KEY=  ENABLE_ANTHROPIC=false
 CACHE_TTL_SECONDS=3600  SEMANTIC_CACHE_ENABLED=true  SEMANTIC_CACHE_THRESHOLD=0.97
-EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_MODEL=text-embedding-004
 RATE_LIMIT_REQUESTS_PER_MINUTE=60  RATE_LIMIT_REQUESTS_PER_DAY=10000
 PROVIDER_FALLBACK_ORDER=openai,gemini  PROVIDER_RETRY_ATTEMPTS=2  PROVIDER_RETRY_DELAY_SECONDS=1
 ```
@@ -91,7 +91,7 @@ Tables:
 - **api_keys** — id UUID pk, name, key_hash, key_prefix (unique idx), user_email, is_admin bool, rate_limit_overrides JSONB, created_at, revoked_at.
 - **usage_logs** — id int pk, api_key_id FK (idx), request_id (idx), model, provider, prompt/completion/total_tokens, cost_usd float, latency_ms, cache_hit enum, status, error, created_at (idx).
 - **cached_responses** — id int pk, request_hash (unique idx), model, messages JSONB, response JSONB, prompt/completion_tokens, created_at, expires_at (idx).
-- **semantic_cache_entries** — id int pk, request_hash FK→cached_responses.request_hash (idx), **embedding VECTOR(1536)** with IVFFlat cosine idx (lists=100), prompt_text, model (idx), created_at.
+- **semantic_cache_entries** — id int pk, request_hash FK→cached_responses.request_hash (idx), **embedding VECTOR(768)** with IVFFlat cosine idx (lists=100), prompt_text, model (idx), created_at. *(Dim = 768 to match Gemini `text-embedding-004`. Migration `f6db56c81d4e` resizes from 1536 → 768.)*
 - **jobs** — id UUID pk, api_key_id FK (idx), kind enum, status enum (idx), input JSONB, result JSONB, error, created_at, started_at, finished_at.
 
 Relationships: ApiKey↔UsageLog, ApiKey↔Job, CachedResponse↔SemanticCacheEntry.
@@ -157,7 +157,7 @@ Seeded: openai(gpt-4o, gpt-4o-mini, gpt-3.5-turbo, text-embedding-3-small), gemi
 `check_and_consume(api_key)` — stub returning None (Phase 11 real impl).
 
 ### app/deps.py
-`@lru_cache get_router()` → single `ProviderRouter()`. `@lru_cache get_embedder()` → single `OpenAIProvider()` used only for `embed()`.
+`@lru_cache get_router()` → single `ProviderRouter()`. `@lru_cache get_embedder()` → single `GeminiProvider()` (produces 768-dim vectors).
 
 ### app/api/v1/chat.py — `POST /v1/chat/completions`
 - Dep: `require_api_key`, `get_db`.
@@ -213,6 +213,8 @@ Redis sliding-window sorted set `ratelimit:{api_key_id}:{window}`, score=timesta
 Counters: `gateway_requests_total{endpoint,status,provider,cache_hit}`, `gateway_tokens_total{provider,kind}`, `gateway_cost_usd_total{provider,api_key_prefix}`, `gateway_provider_errors_total`, `gateway_rate_limit_rejections_total`, `gateway_cache_exact_hits_total/misses_total`. Histogram: `gateway_request_duration_seconds`.
 
 ## Decisions / notes
+- Embedder = Gemini `text-embedding-004` (768 dim). OpenAI-family (via GitHub Models) reserved for chat fallback only; added later.
+- `SEMANTIC_CACHE_THRESHOLD` tuned 0.97 → 0.90 for Gemini embeddings (different embedding space, lower baseline similarity for rephrasings).
 - Postgres host port = **5433** (host machine has native Postgres on 5432).
 - `pgvector/pgvector:pg16` pre-installs the extension; still need `CREATE EXTENSION vector` per-db.
 - App runs on host in dev (fast reloads); containerized only in prod (Phase 15).
