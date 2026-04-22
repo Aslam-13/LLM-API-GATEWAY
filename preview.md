@@ -241,7 +241,58 @@ PYTHONPATH=. .venv/Scripts/celery.exe -A app.worker.celery_app worker -l info --
 Prod linux: `--pool=prefork` (or `--pool=gevent` for I/O-bound).
 
 ### Routes now mounted
-`/v1/chat/completions`, `/v1/embeddings`, `/v1/embeddings/batch`, `/v1/jobs/{job_id}`, `/health`, `/metrics`.
+`/v1/chat/completions`, `/v1/embeddings`, `/v1/embeddings/batch`, `/v1/jobs/{job_id}`, `/admin/me`, `/admin/keys` (GET/POST), `/admin/keys/{id}` (DELETE), `/admin/usage`, `/admin/stats/overview`, `/admin/jobs`, `/health`, `/metrics`.
+
+## Admin endpoints (Phase 14 backend)
+All require `require_admin_key`.
+
+- `GET /admin/me` — echo admin profile.
+- `GET /admin/keys` — list all ApiKeys w/ `last_used_at` derived from `max(usage_logs.created_at)` per key.
+- `POST /admin/keys` — body `{name, email?, admin?}` → returns row + `plaintext` (single exposure).
+- `DELETE /admin/keys/{id}` — soft revoke (sets `revoked_at`).
+- `GET /admin/usage?api_key_id=&from=&to=&limit=&offset=` — rows + `{aggregate: requests/tokens/cost_usd/avg_latency_ms}` + daily series.
+- `GET /admin/stats/overview` — 24h totals (requests, cost, tokens, cache_hit_rate, p95 latency via `percentile_cont`), 24h cache breakdown, 1h requests-per-minute series, 24h hourly stacked cache series.
+- `GET /admin/jobs?status=&limit=&offset=` — paginated Jobs list.
+
+## CORS (main.py)
+`CORSMiddleware` allows `http://localhost:5173`, `http://127.0.0.1:5173` (dashboard dev). Prod will add the production domain once deployed.
+
+## Dashboard (Phase 14 — done)
+React 19 + TypeScript + Vite + Tailwind v3 + TanStack Query v5 + React Router v7 + Axios + Recharts. Dark admin UI. Hosted static bundle in prod; Vite dev server on :5173 with proxy to api :8000 in dev.
+
+### Auth
+Admin paste key → stored in `localStorage["llm-gw-admin-key"]` → axios interceptor adds `Authorization: Bearer …`. 401/403 response → clear + redirect to `/login`.
+
+### Pages (under `Protected` guard)
+- `/login` — single password input; calls `/admin/me` to verify.
+- `/` **Overview** — auto-refresh 10s. Stat cards (requests, cache hit rate, p95 latency, cost+tokens). Line chart `requests/min last 1h`. Stacked bar `cache hits per hour last 24h` (exact/semantic/none).
+- `/keys` **API Keys** — table (name, prefix, email, role, created, last_used, status). Create modal → success modal shows plaintext + copy button. Revoke with confirm.
+- `/usage` — filters (api_key dropdown populated from `/admin/keys`, last N days). Stat cards (aggregate). Daily bar chart. Paginated table with cache-hit pills.
+- `/jobs` — filter by status, auto-refresh 5s. Click row → slide-in drawer with full JSON input + error.
+
+### Folder layout
+```
+dashboard/src/
+  main.tsx           QueryClient + BrowserRouter + App
+  App.tsx            Routes + Protected guard
+  index.css          Tailwind + dark scrollbar
+  auth.ts            localStorage token helpers
+  api.ts             axios client + typed endpoints + types
+  components/
+    Shell.tsx        sidebar layout
+    ui.tsx           Card, StatCard, Pill, Button, Input, Select, Th, Td
+    Modal.tsx        centered modal
+  pages/
+    Login.tsx  Overview.tsx  Keys.tsx  Usage.tsx  Jobs.tsx
+```
+
+### Commands
+```
+cd dashboard
+npm install
+npm run dev      # http://localhost:5173 (proxies /admin /v1 → :8000)
+npm run build    # → dist/
+```
 
 ## Prometheus (planned)
 Counters: `gateway_requests_total{endpoint,status,provider,cache_hit}`, `gateway_tokens_total{provider,kind}`, `gateway_cost_usd_total{provider,api_key_prefix}`, `gateway_provider_errors_total`, `gateway_rate_limit_rejections_total`, `gateway_cache_exact_hits_total/misses_total`. Histogram: `gateway_request_duration_seconds`.
@@ -296,7 +347,7 @@ PYTHONPATH=. .venv/Scripts/python.exe scripts/create_api_key.py --name "user" [-
 - [x] 11 Rate limiting (Redis sliding-window, per-minute + per-day, overrides)
 - [x] 12 Celery worker + jobs (batch_embeddings task, sync `/v1/embeddings`, async `/v1/embeddings/batch`, `/v1/jobs/{id}`)
 - [ ] 13 Prometheus + Grafana
-- [ ] 14 Dashboard (React+Vite)
+- [x] 14 Dashboard + admin endpoints (Vite/React/TS/Tailwind/RQ/Recharts; /admin/keys /admin/usage /admin/stats/overview /admin/jobs)
 - [ ] 15 Nginx + prod Dockerfile + prod compose
 - [ ] 16 Tests
 - [ ] 17 VPS deploy + TLS
