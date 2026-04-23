@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.middleware import require_admin_key
 from app.db.models import ApiKey, CacheHit, UsageLog
+from app.db.models import ApiKey as ApiKeyModel
 from app.db.session import get_db
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -101,4 +102,158 @@ async def overview(
             {"minute": r.minute.isoformat(), "count": r.count} for r in per_minute
         ],
         "cache_hourly_24h": sorted(hourly_map.values(), key=lambda x: x["hour"]),
+    }
+
+
+@router.get("/stats/latency")
+async def latency(
+    _admin: ApiKey = Depends(require_admin_key),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rows = (
+        await db.execute(
+            text(
+                "SELECT date_trunc('hour', created_at) AS t, "
+                "percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms) AS p50, "
+                "percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) AS p95, "
+                "percentile_cont(0.99) WITHIN GROUP (ORDER BY latency_ms) AS p99 "
+                "FROM usage_logs "
+                "WHERE created_at >= now() - interval '24 hours' "
+                "AND status = 'success' "
+                "GROUP BY t ORDER BY t"
+            )
+        )
+    ).all()
+    return {
+        "series": [
+            {
+                "t": r[0].isoformat(),
+                "p50": int(r[1] or 0),
+                "p95": int(r[2] or 0),
+                "p99": int(r[3] or 0),
+            }
+            for r in rows
+        ]
+    }
+
+
+@router.get("/stats/errors")
+async def errors(
+    _admin: ApiKey = Depends(require_admin_key),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rows = (
+        await db.execute(
+            text(
+                "SELECT date_trunc('hour', created_at) AS t, "
+                "count(*) FILTER (WHERE status='error') AS errors, "
+                "count(*) FILTER (WHERE status='rate_limited') AS rate_limited, "
+                "count(*) AS total "
+                "FROM usage_logs "
+                "WHERE created_at >= now() - interval '24 hours' "
+                "GROUP BY t ORDER BY t"
+            )
+        )
+    ).all()
+    return {
+        "series": [
+            {
+                "t": r[0].isoformat(),
+                "errors": int(r[1] or 0),
+                "rate_limited": int(r[2] or 0),
+                "total": int(r[3] or 0),
+                "error_rate": (float(r[1] or 0) / r[3]) if r[3] else 0.0,
+            }
+            for r in rows
+        ]
+    }
+
+
+@router.get("/stats/tokens")
+async def tokens_by_provider(
+    _admin: ApiKey = Depends(require_admin_key),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rows = (
+        await db.execute(
+            text(
+                "SELECT date_trunc('day', created_at) AS d, provider, "
+                "sum(total_tokens) AS tokens "
+                "FROM usage_logs "
+                "WHERE created_at >= now() - interval '7 days' "
+                "AND provider NOT IN ('ratelimit') "
+                "GROUP BY d, provider ORDER BY d, provider"
+            )
+        )
+    ).all()
+    by_day: dict[str, dict] = {}
+    providers: set[str] = set()
+    for day, provider, tokens in rows:
+        key = day.isoformat()
+        providers.add(provider)
+        by_day.setdefault(key, {"d": key})[provider] = int(tokens or 0)
+    # fill missing providers with 0 for nice stacked chart
+    for day_bucket in by_day.values():
+        for p in providers:
+            day_bucket.setdefault(p, 0)
+    return {
+        "providers": sorted(providers),
+        "series": sorted(by_day.values(), key=lambda x: x["d"]),
+    }
+
+
+@router.get("/stats/cost-by-key")
+async def cost_by_key(
+    _admin: ApiKey = Depends(require_admin_key),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rows = (
+        await db.execute(
+            text(
+                "SELECT k.name, k.key_prefix, "
+                "coalesce(sum(u.cost_usd), 0) AS cost, "
+                "coalesce(sum(u.total_tokens), 0) AS tokens, "
+                "count(u.id) AS requests "
+                "FROM api_keys k "
+                "LEFT JOIN usage_logs u "
+                "  ON u.api_key_id = k.id "
+                "  AND u.created_at >= now() - interval '7 days' "
+                "GROUP BY k.id, k.name, k.key_prefix "
+                "ORDER BY cost DESC "
+                "LIMIT 10"
+            )
+        )
+    ).all()
+    return {
+        "rows": [
+            {
+                "name": r[0],
+                "prefix": r[1],
+                "cost_usd": float(r[2] or 0),
+                "tokens": int(r[3] or 0),
+                "requests": int(r[4] or 0),
+            }
+            for r in rows
+        ]
+    }
+
+
+@router.get("/stats/rate-limits")
+async def rate_limits(
+    _admin: ApiKey = Depends(require_admin_key),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    rows = (
+        await db.execute(
+            text(
+                "SELECT date_trunc('hour', created_at) AS t, count(*) AS rejections "
+                "FROM usage_logs "
+                "WHERE status = 'rate_limited' "
+                "AND created_at >= now() - interval '24 hours' "
+                "GROUP BY t ORDER BY t"
+            )
+        )
+    ).all()
+    return {
+        "series": [{"t": r[0].isoformat(), "rejections": int(r[1])} for r in rows]
     }

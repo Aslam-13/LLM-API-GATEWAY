@@ -241,7 +241,7 @@ PYTHONPATH=. .venv/Scripts/celery.exe -A app.worker.celery_app worker -l info --
 Prod linux: `--pool=prefork` (or `--pool=gevent` for I/O-bound).
 
 ### Routes now mounted
-`/v1/chat/completions`, `/v1/embeddings`, `/v1/embeddings/batch`, `/v1/jobs/{job_id}`, `/admin/me`, `/admin/keys` (GET/POST), `/admin/keys/{id}` (DELETE), `/admin/usage`, `/admin/stats/overview`, `/admin/jobs`, `/health`, `/metrics`.
+`/v1/chat/completions`, `/v1/embeddings`, `/v1/embeddings/batch`, `/v1/jobs/{job_id}`, `/admin/me`, `/admin/keys` (GET/POST), `/admin/keys/{id}` (DELETE), `/admin/usage`, `/admin/stats/overview`, `/admin/stats/latency`, `/admin/stats/errors`, `/admin/stats/tokens`, `/admin/stats/cost-by-key`, `/admin/stats/rate-limits`, `/admin/jobs`, `/health`, `/metrics` (Prometheus text).
 
 ## Admin endpoints (Phase 14 backend)
 All require `require_admin_key`.
@@ -252,7 +252,18 @@ All require `require_admin_key`.
 - `DELETE /admin/keys/{id}` — soft revoke (sets `revoked_at`).
 - `GET /admin/usage?api_key_id=&from=&to=&limit=&offset=` — rows + `{aggregate: requests/tokens/cost_usd/avg_latency_ms}` + daily series.
 - `GET /admin/stats/overview` — 24h totals (requests, cost, tokens, cache_hit_rate, p95 latency via `percentile_cont`), 24h cache breakdown, 1h requests-per-minute series, 24h hourly stacked cache series.
+- `GET /admin/stats/latency` — 24h hourly p50/p95/p99 of `latency_ms` (success only).
+- `GET /admin/stats/errors` — 24h hourly `{errors, rate_limited, total, error_rate}`.
+- `GET /admin/stats/tokens` — 7d daily tokens **stacked by provider**; response includes `providers[]` + normalized per-day buckets with zero-fill.
+- `GET /admin/stats/cost-by-key` — top-10 API keys by 7d cost (LEFT JOIN api_keys so zero-usage keys still appear at bottom).
+- `GET /admin/stats/rate-limits` — 24h hourly rejection count (status='rate_limited').
 - `GET /admin/jobs?status=&limit=&offset=` — paginated Jobs list.
+
+### Rate-limit logging
+`check_and_consume` raises 429. `chat.py` + `embeddings.py` (both sync + batch) catch HTTPException with status=429, insert a `UsageLog(status='rate_limited', provider='ratelimit', model='...')` row before re-raising. Feeds the errors + rate-limits charts.
+
+### /metrics (Prometheus text)
+`GET /metrics` → `prometheus_client.generate_latest()` with `CONTENT_TYPE_LATEST`. Serves all counters/histograms registered in `app/metrics/prometheus.py`. No Prometheus server runs locally; endpoint is scrape-able by anyone who wants to run one.
 
 ## CORS (main.py)
 `CORSMiddleware` allows `http://localhost:5173`, `http://127.0.0.1:5173` (dashboard dev). Prod will add the production domain once deployed.
@@ -265,7 +276,15 @@ Admin paste key → stored in `localStorage["llm-gw-admin-key"]` → axios inter
 
 ### Pages (under `Protected` guard)
 - `/login` — single password input; calls `/admin/me` to verify.
-- `/` **Overview** — auto-refresh 10s. Stat cards (requests, cache hit rate, p95 latency, cost+tokens). Line chart `requests/min last 1h`. Stacked bar `cache hits per hour last 24h` (exact/semantic/none).
+- `/` **Overview** — SQL-over-`usage_logs` operations dashboard. Auto-refresh 10s for live stats, 30s/60s for slower charts. Charts:
+  - Stat cards: 24h requests, cache hit rate, p95 latency, cost + tokens.
+  - Line: requests / minute (1h).
+  - Stacked bar: cache hits / hour (24h) — exact / semantic / none.
+  - Line: p50 / p95 / p99 latency (24h hourly).
+  - Stacked bar: errors + rate-limited per hour (24h).
+  - Stacked bar: tokens by provider (7d daily).
+  - Table: top-10 cost by API key (7d).
+  - Line: rate-limit rejections per hour (24h).
 - `/keys` **API Keys** — table (name, prefix, email, role, created, last_used, status). Create modal → success modal shows plaintext + copy button. Revoke with confirm.
 - `/usage` — filters (api_key dropdown populated from `/admin/keys`, last N days). Stat cards (aggregate). Daily bar chart. Paginated table with cache-hit pills.
 - `/jobs` — filter by status, auto-refresh 5s. Click row → slide-in drawer with full JSON input + error.
@@ -298,9 +317,21 @@ npm run build    # → dist/
 Counters: `gateway_requests_total{endpoint,status,provider,cache_hit}`, `gateway_tokens_total{provider,kind}`, `gateway_cost_usd_total{provider,api_key_prefix}`, `gateway_provider_errors_total`, `gateway_rate_limit_rejections_total`, `gateway_cache_exact_hits_total/misses_total`. Histogram: `gateway_request_duration_seconds`.
 
 ## Decisions / notes
-- Embedder = Gemini `text-embedding-004` (768 dim). OpenAI-family (via GitHub Models) reserved for chat fallback only; added later.
+- Embedder = Gemini `models/gemini-embedding-001` with `output_dimensionality=768`. OpenAI-family (via GitHub Models) reserved for chat fallback only; added later.
 - `SEMANTIC_CACHE_THRESHOLD` tuned 0.97 → 0.90 for Gemini embeddings (different embedding space, lower baseline similarity for rephrasings).
 - Postgres host port = **5433** (host machine has native Postgres on 5432).
+- **Observability stack = SQL-over-Postgres + Prometheus-format `/metrics` endpoint. No Prometheus server, no Grafana.** Rationale:
+  - At current scale (single service, <1000 rps), `usage_logs` IS the time-series. `date_trunc` + `percentile_cont` produce every operational chart Grafana would.
+  - Running Grafana locally adds portal-based dashboard authoring pain (same UX on cloud, ruled out).
+  - `/metrics` still serves standard Prometheus text (via `prometheus_client.generate_latest`) — external scrapers can consume when scale demands.
+  - No `psutil` / system metrics endpoint — internal tool, rarely needed.
+  - Scale-out plan when it matters: add nightly Celery Beat rollup of `usage_logs` → `usage_daily`, delete raw >30d.
+- Phase 13 (Prometheus + Grafana) **deliberately skipped**; replaced by Phase 14 dashboard extensions.
+
+## CV framing lines (copy into README/resume when Phase 18 lands)
+- **Short:** *"real-time ops dashboard over structured request logs."*
+- **Longer:** *"Designed a single-service observability stack using request-level structured logs as the source of truth — p50/p95/p99 latency, error + rate-limit rates, per-provider token breakdown, and cost attribution — avoiding the operational cost of a separate time-series database at current scale."*
+- **Signal sentence to tack on:** *"Exposes standard Prometheus `/metrics`; designed to be scraped externally when scale demands it."*
 - `pgvector/pgvector:pg16` pre-installs the extension; still need `CREATE EXTENSION vector` per-db.
 - App runs on host in dev (fast reloads); containerized only in prod (Phase 15).
 - `expire_on_commit=False` on session to keep ORM objects usable after commit.
@@ -360,7 +391,7 @@ PYTHONPATH=. .venv/Scripts/python.exe scripts/create_api_key.py --name "user" [-
 - [x] 10 /v1/chat/completions (auth→ratelimit stub→exact→semantic→router, UsageLog, metrics, OpenAI-shaped response)
 - [x] 11 Rate limiting (Redis sliding-window, per-minute + per-day, overrides)
 - [x] 12 Celery worker + jobs (batch_embeddings task, sync `/v1/embeddings`, async `/v1/embeddings/batch`, `/v1/jobs/{id}`)
-- [ ] 13 Prometheus + Grafana
+- [x] 13 Observability (**SQL-over-Postgres dashboards + Prometheus `/metrics` endpoint, no Prometheus server / Grafana** — rationale in Decisions)
 - [x] 14 Dashboard + admin endpoints (Vite/React/TS/Tailwind/RQ/Recharts; /admin/keys /admin/usage /admin/stats/overview /admin/jobs)
 - [x] 16 Tests — 17 unit + 4 integration (chat auth+cache path mocked). Locust load test staged for post-deploy.
 - [ ] 15 Nginx + prod Dockerfile + prod compose

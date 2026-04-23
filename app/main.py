@@ -1,8 +1,8 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from app.api.admin.jobs import router as admin_jobs_router
 from app.api.admin.keys import router as admin_keys_router
@@ -53,6 +53,6 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.get("/metrics", response_class=PlainTextResponse)
-async def metrics() -> str:
-    return ""
+@app.get("/metrics")
+async def metrics() -> Response:
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)

@@ -38,7 +38,16 @@ async def chat_completions(
     start = time.perf_counter()
     settings = get_settings()
 
-    await check_and_consume(api_key)
+    try:
+        await check_and_consume(api_key)
+    except HTTPException as e:
+        if e.status_code == 429:
+            await _log_usage(
+                db, api_key, request_id, req.model, "ratelimit",
+                0, 0, 0.0, int((time.perf_counter() - start) * 1000),
+                CacheHit.none, "rate_limited", str(e.detail),
+            )
+        raise
 
     request_hash = build_request_hash(req)
     response: NormalizedResponse | None = None

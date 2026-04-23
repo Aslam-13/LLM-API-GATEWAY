@@ -113,4 +113,39 @@ export const adminApi = {
     api
       .get<{ total: number; rows: JobRow[] }>("/admin/jobs", { params })
       .then((r) => r.data),
+
+  latency: () =>
+    api
+      .get<{ series: { t: string; p50: number; p95: number; p99: number }[] }>(
+        "/admin/stats/latency"
+      )
+      .then((r) => r.data),
+  errors: () =>
+    api
+      .get<{
+        series: {
+          t: string;
+          errors: number;
+          rate_limited: number;
+          total: number;
+          error_rate: number;
+        }[];
+      }>("/admin/stats/errors")
+      .then((r) => r.data),
+  tokensByProvider: () =>
+    api
+      .get<{ providers: string[]; series: Record<string, string | number>[] }>(
+        "/admin/stats/tokens"
+      )
+      .then((r) => r.data),
+  costByKey: () =>
+    api
+      .get<{
+        rows: { name: string; prefix: string; cost_usd: number; tokens: number; requests: number }[];
+      }>("/admin/stats/cost-by-key")
+      .then((r) => r.data),
+  rateLimits: () =>
+    api
+      .get<{ series: { t: string; rejections: number }[] }>("/admin/stats/rate-limits")
+      .then((r) => r.data),
 };

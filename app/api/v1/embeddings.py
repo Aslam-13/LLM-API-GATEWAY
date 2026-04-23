@@ -6,12 +6,33 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.middleware import require_api_key
 from app.config import get_settings
-from app.db.models import ApiKey, Job, JobKind, JobStatus
+from app.db.models import ApiKey, CacheHit, Job, JobKind, JobStatus, UsageLog
 from app.db.session import get_db
 from app.deps import get_embedder
 from app.providers.base import ProviderError
 from app.ratelimit.sliding_window import check_and_consume
 from app.worker.tasks import batch_embeddings_task
+
+
+async def _log_rate_limited(db: AsyncSession, api_key: ApiKey, detail: str) -> None:
+    import uuid
+    db.add(
+        UsageLog(
+            api_key_id=api_key.id,
+            request_id=uuid.uuid4().hex,
+            model="embeddings",
+            provider="ratelimit",
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            cost_usd=0.0,
+            latency_ms=0,
+            cache_hit=CacheHit.none,
+            status="rate_limited",
+            error=detail,
+        )
+    )
+    await db.commit()
 
 router = APIRouter(prefix="/v1", tags=["embeddings"])
 
@@ -33,8 +54,14 @@ class BatchEmbeddingRequest(BaseModel):
 async def embeddings(
     body: EmbeddingRequest,
     api_key: ApiKey = Depends(require_api_key),
+    db: AsyncSession = Depends(get_db),
 ) -> dict:
-    await check_and_consume(api_key)
+    try:
+        await check_and_consume(api_key)
+    except HTTPException as e:
+        if e.status_code == 429:
+            await _log_rate_limited(db, api_key, str(e.detail))
+        raise
     texts = [body.input] if isinstance(body.input, str) else body.input
     if not texts:
         raise HTTPException(status_code=400, detail="input empty")
@@ -64,7 +91,12 @@ async def embeddings_batch(
     api_key: ApiKey = Depends(require_api_key),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    await check_and_consume(api_key)
+    try:
+        await check_and_consume(api_key)
+    except HTTPException as e:
+        if e.status_code == 429:
+            await _log_rate_limited(db, api_key, str(e.detail))
+        raise
     if body.provider not in {"openai", "gemini"}:
         raise HTTPException(status_code=400, detail="provider must be openai or gemini")
     model = body.model or get_settings().embedding_model
