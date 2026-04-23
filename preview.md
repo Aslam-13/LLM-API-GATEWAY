@@ -309,6 +309,20 @@ Counters: `gateway_requests_total{endpoint,status,provider,cache_hit}`, `gateway
 - Streaming responses: OUT for v1.
 - Anthropic provider: stub only until Phase pushes `ENABLE_ANTHROPIC=true`.
 
+## Tests (Phase 16 — core only, not exhaustive)
+`pytest-asyncio 1.3.0` (session-scoped test loop + fixture loop, configured via `pyproject.toml`).
+
+- `tests/conftest.py` — sets `SEMANTIC_CACHE_ENABLED=false` for tests; `reset_state` autouse fixture FLUSHDB + TRUNCATEs `usage_logs`, `jobs`, `cached_responses`, `semantic_cache_entries` between tests; `client` yields `httpx.AsyncClient(transport=ASGITransport(app))`; `test_key` seeds a scoped non-admin ApiKey and deletes it (+ its usage/jobs) on teardown. `api_keys` is otherwise preserved.
+- **Unit** (no infra): `test_cache_keys.py` (hash determinism / field sensitivity / last_user_message), `test_auth_keys.py` (generate/verify/extract_prefix), `test_pricing.py` (known/unknown model), `test_router.py` (retry→fallback on server error, auth=fatal-no-fallback, all-exhausted).
+- **Integration** (dev Postgres + Redis up): `test_chat_completions.py` — 401 missing auth, 403 bad key, 200 + exact-cache hit on repeat (mocked router via `monkeypatch.setattr("app.api.v1.chat.get_router", ...)` — plain-function call, not FastAPI dep, so `dependency_overrides` does NOT work), 422 validation.
+- Current: **18 passed**. Noise: Redis `__del__` "Event loop is closed" at process exit is cosmetic.
+
+## Load (Phase 18 — post-deploy)
+`tests/load/locustfile.py`. Mix: 60% chat (~30% unseen prompts to exercise cache), 20% sync `/v1/embeddings`, 10% async batch + job poll, 10% `/admin/stats/overview`. Env: `GATEWAY_API_KEY` (required), `GATEWAY_ADMIN_KEY` (optional), `CHAT_MODEL`, `EMBED_MODEL`, `EMBED_PROVIDER`. Run:
+```
+locust -f tests/load/locustfile.py --host https://api.yourdomain.com --users 50 --spawn-rate 5 --run-time 10m --headless --csv results
+```
+
 ## Commands cheatsheet
 ```
 # Infra
@@ -348,6 +362,7 @@ PYTHONPATH=. .venv/Scripts/python.exe scripts/create_api_key.py --name "user" [-
 - [x] 12 Celery worker + jobs (batch_embeddings task, sync `/v1/embeddings`, async `/v1/embeddings/batch`, `/v1/jobs/{id}`)
 - [ ] 13 Prometheus + Grafana
 - [x] 14 Dashboard + admin endpoints (Vite/React/TS/Tailwind/RQ/Recharts; /admin/keys /admin/usage /admin/stats/overview /admin/jobs)
+- [x] 16 Tests — 17 unit + 4 integration (chat auth+cache path mocked). Locust load test staged for post-deploy.
 - [ ] 15 Nginx + prod Dockerfile + prod compose
 - [ ] 16 Tests
 - [ ] 17 VPS deploy + TLS
