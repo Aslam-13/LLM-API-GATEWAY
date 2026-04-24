@@ -156,4 +156,191 @@ py -3.11 -m venv .venv -> to specify the exact version
   Plan's current v1 → v1.5 → v2 roadmap (in plan.md Phase 18) hints at that evolution: streaming (v1.5), multi-tenant
   orgs + BYO keys (v2). Ship v1 first. That's the plan.
 
-────────────────────────────────────────
+
+
+
+
+
+  What RabbitMQ did in your test
+
+  When you hit POST /v1/embeddings/batch, here's the full flow:
+
+  1. FastAPI   → inserts Job row in Postgres (status=pending)
+                 returns {job_id, status: pending} immediately (202)
+  2. FastAPI   → calls batch_embeddings_task.delay(job_id, "gemini", model, texts)
+                 Celery serializes args → JSON message
+                 Celery publishes message to RabbitMQ queue "celery"
+  3. RabbitMQ  → holds message until a consumer (worker) pulls it
+  4. Worker    → pulls message, deserializes, runs Python function
+                 updates Job row (running → succeeded, stores vectors)
+                 ACKs message → RabbitMQ removes it
+  5. Worker    → stores return value in Redis (DB 1, result backend)
+
+
+    Celery is not the queue. Celery is a Python framework that:
+
+  1. Client side (inside FastAPI): wraps batch_embeddings_task.delay(...) so it looks like a normal function call, but
+  actually serializes args → JSON → publishes to RabbitMQ. Returns immediately.
+  2. Worker side (terminal B): long-running Python process that subscribes to the queue, receives messages, deserializes
+   args, invokes the actual batch_embeddings_task Python function, handles retries, stores the return value in Redis,
+  ACKs the message.
+  3. Result backend (Redis DB 1): after the task returns a value, Celery stores it there under the task ID. If someone
+  later calls .get() on the task, Celery fetches from Redis.
+
+  
+════════════════════════════════════════════════════════════════════
+  MANUAL END-TO-END TEST GUIDE  (Phases 0 → 14 + observability)
+  Goal: verify app + db + redis + rabbitmq + worker + dashboard locally.
+  Windows: bash / PowerShell. Paths use forward slashes.
+════════════════════════════════════════════════════════════════════
+
+# 0. Prerequisites (one-time)
+py --list                                  # confirm 3.11 present
+node --version && npm --version            # node >=18
+docker --version && docker compose version
+
+# 1. venv + deps (already done; re-check)
+py -3.11 -m venv .venv
+.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+
+# 2. Infra up (Postgres pgvector, Redis, RabbitMQ)
+docker compose -f docker-compose.dev.yml up -d
+docker compose -f docker-compose.dev.yml ps        # all 3 Up (healthy)
+
+# 2a. Sanity: DB reachable, pgvector installed
+docker exec gateway-postgres psql -U gateway -d gateway -c "SELECT extname,extversion FROM pg_extension WHERE extname='vector';"
+docker exec gateway-redis redis-cli ping                          # PONG
+# RabbitMQ UI:  http://localhost:15672   (guest / guest)
+
+# 3. Migrations (5 tables + vector col + ivfflat index)
+.venv/Scripts/alembic.exe upgrade head
+docker exec gateway-postgres psql -U gateway -d gateway -c "\dt"
+docker exec gateway-postgres psql -U gateway -d gateway -c "\d semantic_cache_entries"
+
+# 4. Backend  (terminal A)
+PYTHONPATH=. .venv/Scripts/python.exe -m uvicorn app.main:app --reload
+# health checks:
+curl http://localhost:8000/health                # {"status":"ok"}
+curl http://localhost:8000/metrics | head        # gateway_* Prometheus text
+
+# 5. Celery worker  (terminal B)  — needed for /v1/embeddings/batch
+PYTHONPATH=. .venv/Scripts/celery.exe -A app.worker.celery_app worker -l info --pool=solo
+# Watch http://localhost:15672 -> Queues tab; tasks land here.
+
+# 6. Dashboard  (terminal C)
+cd dashboard
+npm install                     # first time only
+npm run dev                     # http://localhost:5173
+# Log in with ADMIN_KEY (from chat history or /admin/keys).
+
+--------------------------------------------------------------------
+  API MANUAL TESTS  (terminal D, backend must be up)
+  Replace USER_KEY / ADMIN_KEY with real values.
+--------------------------------------------------------------------
+
+USER_KEY=sk-gw-live-XgoWz0UJEqJ-h24Rcc3L7xZvLqHoqBO7
+ADMIN_KEY=sk-gw-live-q5O6ES0VSCMOz14eLpHqgqxY1rT4py6y
+
+# a. Auth gating
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d "{}"                                                # 401
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8000/v1/chat/completions -H "Authorization: Bearer sk-gw-live-bad" -H "Content-Type: application/json" -d "{}"   # 403/422
+
+# b. Chat caching (miss -> exact hit -> semantic hit)
+curl -X POST http://localhost:8000/v1/chat/completions -H "Authorization: Bearer sk-gw-live-XgoWz0UJEqJ-h24Rcc3L7xZvLqHoqBO7" -H "Content-Type: application/json" -d "{\"model\":\"gemini-2.5-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"What is the capital of France?\"}]}"
+# expect "x_cache_hit":"none"    ~1000-2000ms
+# repeat same body:              "x_cache_hit":"exact"   ~10ms
+# NEW phrasing (never asked):
+curl -X POST http://localhost:8000/v1/chat/completions -H "Authorization: Bearer sk-gw-live-XgoWz0UJEqJ-h24Rcc3L7xZvLqHoqBO7" -H "Content-Type: application/json" -d "{\"model\":\"gemini-2.5-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"Name the capital city of France please\"}]}"
+# expect "x_cache_hit":"semantic"  ~300-600ms
+
+# c. Rate limit (default 60/min) — fire 70 quick
+for i in $(seq 1 70); do curl -s -o /dev/null -w "%{http_code} " -X POST http://localhost:8000/v1/chat/completions -H "Authorization: Bearer sk-gw-live-XgoWz0UJEqJ-h24Rcc3L7xZvLqHoqBO7" -H "Content-Type: application/json" -d "{\"model\":\"gemini-2.5-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"loop\"}]}"; done; echo
+# 200 ... eventually 429s after ~60
+
+# d. Sync embeddings
+curl -X POST http://localhost:8000/v1/embeddings -H "Authorization: Bearer sk-gw-live-XgoWz0UJEqJ-h24Rcc3L7xZvLqHoqBO7" -H "Content-Type: application/json" -d "{\"input\":\"hello world\"}"
+
+# e. Batch embeddings (Celery)
+JOB=$(curl -s -X POST http://localhost:8000/v1/embeddings/batch -H "Authorization: Bearer sk-gw-live-XgoWz0UJEqJ-h24Rcc3L7xZvLqHoqBO7" -H "Content-Type: application/json" -d "{\"provider\":\"gemini\",\"input\":[\"a\",\"b\",\"c\"]}" | python -c "import sys,json;print(json.load(sys.stdin)['job_id'])")
+echo $JOB
+# watch terminal B for worker logs, then:
+curl http://localhost:8000/v1/jobs/$JOB -H "Authorization: Bearer sk-gw-live-XgoWz0UJEqJ-h24Rcc3L7xZvLqHoqBO7"
+# status: pending -> running -> succeeded
+
+# f. Admin endpoints (all Prometheus-free, SQL over usage_logs)
+curl http://localhost:8000/admin/me                       -H "Authorization: Bearer $ADMIN_KEY"
+curl http://localhost:8000/admin/keys                     -H "Authorization: Bearer $ADMIN_KEY"
+curl http://localhost:8000/admin/stats/overview           -H "Authorization: Bearer $ADMIN_KEY"
+curl http://localhost:8000/admin/stats/latency            -H "Authorization: Bearer $ADMIN_KEY"
+curl http://localhost:8000/admin/stats/errors             -H "Authorization: Bearer $ADMIN_KEY"
+curl http://localhost:8000/admin/stats/tokens             -H "Authorization: Bearer $ADMIN_KEY"
+curl http://localhost:8000/admin/stats/cost-by-key        -H "Authorization: Bearer $ADMIN_KEY"
+curl http://localhost:8000/admin/stats/rate-limits        -H "Authorization: Bearer $ADMIN_KEY"
+
+--------------------------------------------------------------------
+  DATA-LAYER CHECKS  (what actually landed in each service)
+--------------------------------------------------------------------
+
+# Postgres
+docker exec gateway-postgres psql -U gateway -d gateway -c "SELECT count(*) FROM api_keys;"
+docker exec gateway-postgres psql -U gateway -d gateway -c "SELECT provider,cache_hit,status,latency_ms,cost_usd,created_at FROM usage_logs ORDER BY created_at DESC LIMIT 10;"
+docker exec gateway-postgres psql -U gateway -d gateway -c "SELECT count(*), min(created_at), max(created_at) FROM semantic_cache_entries;"
+docker exec gateway-postgres psql -U gateway -d gateway -c "SELECT id,status,kind,created_at,finished_at FROM jobs ORDER BY created_at DESC LIMIT 5;"
+
+# Redis
+docker exec gateway-redis redis-cli KEYS "cache:exact:*"     | head
+docker exec gateway-redis redis-cli KEYS "ratelimit:*"       | head
+
+# RabbitMQ
+# UI: http://localhost:15672 -> Queues -> celery
+docker exec gateway-rabbitmq rabbitmqctl list_queues name messages
+
+--------------------------------------------------------------------
+  DASHBOARD CHECKS  (http://localhost:5173)
+--------------------------------------------------------------------
+
+1. /login            paste ADMIN_KEY -> navigates to /
+2. /  Overview       stat cards + 7 charts (fire a few API calls first for data)
+3. /keys             see seeded keys; "+ New key" -> modal -> plaintext once -> Copy
+4. /usage            filter by key + last N days; table + daily bar chart
+5. /jobs             submit /v1/embeddings/batch (step e) -> row, status flips to succeeded within ~5s
+
+--------------------------------------------------------------------
+  AUTOMATED TESTS
+--------------------------------------------------------------------
+
+.venv/Scripts/python.exe -m pytest -q             # 18 tests, all green
+.venv/Scripts/python.exe -m pytest tests/unit -q  # unit only, no infra
+
+--------------------------------------------------------------------
+  SHUTDOWN
+--------------------------------------------------------------------
+
+Ctrl+C in terminals A / B / C
+docker compose -f docker-compose.dev.yml down             # keeps data
+docker compose -f docker-compose.dev.yml down -v          # wipes volumes
+
+--------------------------------------------------------------------
+  TROUBLESHOOTING
+--------------------------------------------------------------------
+
+- Port 5432 taken -> we use host port 5433 (docker-compose.dev.yml + .env).
+- .env changes not taking effect -> full uvicorn restart (--reload watches .py only).
+- Semantic cache not firing -> use a NEW phrasing; exact cache shadows otherwise.
+- Celery task doesn't run -> check worker running with --pool=solo on Windows.
+- Gemini 404 on embed -> embedder uses models/gemini-embedding-001 with
+  output_dimensionality=768 to match VECTOR(768) column.
+- "Event loop is closed" noise at test exit -> cosmetic Redis __del__, ignore.
+
+--------------------------------------------------------------------
+  FAST REFERENCE — what's where
+--------------------------------------------------------------------
+
+Backend source            app/
+Admin endpoints           app/api/admin/
+Dashboard                 dashboard/src/
+Migrations                alembic/versions/
+Tests                     tests/unit, tests/integration, tests/load
+Whole-project snapshot    preview.md   (read this first next session)
+Phase roadmap             plan.md
+Dashboard roadmap         dashboard/plan.md
