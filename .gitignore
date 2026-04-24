@@ -30,6 +30,7 @@ ENV/
 .env
 .env.*
 !.env.example
+!.env.prod.example
 
 # Testing / coverage
 .pytest_cache/
@@ -56,3 +57,4 @@ Thumbs.db
 # Dashboard
 dashboard/node_modules/
 dashboard/dist/
+.env.prod

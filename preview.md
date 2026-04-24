@@ -340,6 +340,53 @@ Counters: `gateway_requests_total{endpoint,status,provider,cache_hit}`, `gateway
 - Streaming responses: OUT for v1.
 - Anthropic provider: stub only until Phase pushes `ENABLE_ANTHROPIC=true`.
 
+## Production deploy (Phases 15 + 17 — Codespaces target)
+
+### Strategy
+Single GitHub Codespace running the full stack via `docker-compose.prod.yml`. No VPS / nginx-on-host / certbot — Codespaces auto-fronts forwarded ports with HTTPS. Demo URL: `https://<codespace-name>-80.app.github.dev` (port visibility set to public). Codespace sleeps after ~30 min idle; this is acceptable for a CV demo (start before showing).
+
+### Files
+- `docker/Dockerfile` — multi-stage. **Stage 1 (builder)**: `python:3.11-slim`, build-essential, `pip wheel` to `/wheels`. **Stage 2 (runtime)**: slim, non-root user `app` (uid 1000), `pip install --no-index --find-links=/wheels`. Healthcheck on `/health`. EXPOSE 8000. Same image for API and worker (branched by `entrypoint.sh`).
+- `docker/entrypoint.sh` — `case` on `$1` (or `$ROLE`):
+  - `api` → `gunicorn -k uvicorn.workers.UvicornWorker -w $WEB_CONCURRENCY -b 0.0.0.0:8000 app.main:app`
+  - `worker` → `celery -A app.worker.celery_app worker --pool=prefork --concurrency=$CELERY_CONCURRENCY`
+  - `migrate` → `alembic upgrade head` (one-shot)
+- `dashboard/Dockerfile` — node:22-alpine builds `dist/`; nginx:1.27-alpine serves `dist/` AND reverse-proxies `/v1` `/admin` `/health` `/metrics` to `api:8000`. Build step strips any `.env*` so the bundle uses same-origin relative paths (no CORS in prod).
+- `nginx/prod.conf` — single vhost on :80. Hashed `/assets/` → 30d immutable cache. SPA fallback `try_files $uri $uri/ /index.html`. `client_max_body_size 20m` for batch embeddings.
+- `docker-compose.prod.yml` — services: postgres, redis, rabbitmq (data volumes + healthchecks) → migrate (one-shot via `service_completed_successfully`) → api + worker (env_file `.env.prod`) → web (nginx, only port published: `80:80`). API is **internal-only** (`expose: 8000`) — exposed via web/nginx.
+- `.env.prod.example` — committed template; service-name hosts (`postgres`, `redis`, `rabbitmq`), `APP_ENV=prod`, `APP_DEBUG=false`, runtime knobs (`WEB_CONCURRENCY`, `CELERY_CONCURRENCY`).
+- `.env.prod` — git-ignored real secrets. Copy from example before `up`.
+- `.devcontainer/devcontainer.json` — Codespaces config. Base ubuntu-22.04 + Python 3.11 + Node 22 + docker-in-docker features. Port forwards: 80 (public), 8000 / 5173 / 15672 (private). `postCreateCommand` creates venv + pip install + dashboard `npm ci`.
+
+### Codespaces deploy commands
+```bash
+# inside codespace, one-time:
+cp .env.prod.example .env.prod
+nano .env.prod                 # paste real GEMINI_API_KEY etc.
+
+# build + start everything:
+docker compose -f docker-compose.prod.yml up -d --build
+
+# create an admin key:
+docker compose -f docker-compose.prod.yml exec api \
+  python scripts/create_api_key.py --name "demo-admin" --admin
+
+# tail logs:
+docker compose -f docker-compose.prod.yml logs -f api worker
+
+# Then in Codespaces UI → Ports tab → port 80 → set Visibility = Public.
+# Open the forwarded URL → dashboard loads, API responds.
+```
+
+### What changed vs the original VPS plan
+- No host-side nginx, no certbot, no UFW — Codespaces handles SSL + edge.
+- No SSH / `adduser` / DNS — N/A.
+- Single port published (80). 8000 internal-only via `expose:`.
+- Migration runs once via dedicated `migrate` service with `service_completed_successfully` dependency.
+
+### CV framing
+*"Containerized full stack (Python + React) with multi-stage builds, single-image API/worker via entrypoint role-branching, Postgres + Redis + RabbitMQ orchestration via Docker Compose, deployed on a free dev container with same-origin nginx routing."*
+
 ## Tests (Phase 16 — core only, not exhaustive)
 `pytest-asyncio 1.3.0` (session-scoped test loop + fixture loop, configured via `pyproject.toml`).
 
@@ -393,7 +440,9 @@ PYTHONPATH=. .venv/Scripts/python.exe scripts/create_api_key.py --name "user" [-
 - [x] 12 Celery worker + jobs (batch_embeddings task, sync `/v1/embeddings`, async `/v1/embeddings/batch`, `/v1/jobs/{id}`)
 - [x] 13 Observability (**SQL-over-Postgres dashboards + Prometheus `/metrics` endpoint, no Prometheus server / Grafana** — rationale in Decisions)
 - [x] 14 Dashboard + admin endpoints (Vite/React/TS/Tailwind/RQ/Recharts; /admin/keys /admin/usage /admin/stats/overview /admin/jobs)
+- [x] 15 Prod stack (Dockerfile + entrypoint + dashboard image + nginx + docker-compose.prod.yml + .env.prod.example)
 - [x] 16 Tests — 17 unit + 4 integration (chat auth+cache path mocked). Locust load test staged for post-deploy.
+- [x] 17 Codespaces deploy (.devcontainer/devcontainer.json — public port 80, single-origin nginx routing, no VPS/TLS/DNS)
 - [ ] 15 Nginx + prod Dockerfile + prod compose
 - [ ] 16 Tests
 - [ ] 17 VPS deploy + TLS
