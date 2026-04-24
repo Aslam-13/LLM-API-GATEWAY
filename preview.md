@@ -387,6 +387,36 @@ docker compose -f docker-compose.prod.yml logs -f api worker
 ### CV framing
 *"Containerized full stack (Python + React) with multi-stage builds, single-image API/worker via entrypoint role-branching, Postgres + Redis + RabbitMQ orchestration via Docker Compose, deployed on a free dev container with same-origin nginx routing."*
 
+## CI / CD (GitHub Actions)
+
+### Honest constraint
+Codespaces is a dev environment, not a deploy target. True "auto-deploy on merge" requires a real server. Current setup: **CI on every push + GHCR image publish on main merge + manual pull-in-codespace**. A real deploy-on-merge step slots in when there's a VPS.
+
+### `.github/workflows/ci.yml`
+- Triggers: all pushes to `main` + all PRs.
+- Job `backend`: spins up `pgvector/pgvector:pg16` + `redis:7-alpine` service containers. Installs `requirements-dev.txt`, runs `ruff check .`, runs `alembic upgrade head`, runs `pytest -q`.
+- Job `dashboard`: Node 22, `npm install`, `npm run build` (type-checks + bundles).
+- Concurrency: cancels superseded runs on the same ref.
+- Env in CI: `SEMANTIC_CACHE_ENABLED=false`, dummy `GEMINI_API_KEY` / `OPENAI_API_KEY` (embedders never hit external APIs in tests).
+
+### `.github/workflows/publish.yml`
+- Triggers: push to `main`, or manual `workflow_dispatch`.
+- Matrix builds two images → `ghcr.io/<owner>/<repo>/gateway-api` and `gateway-web`.
+- Tags: git SHA + `latest`. Uses `docker/build-push-action` with GHA cache (`type=gha`) for fast rebuilds.
+- `permissions: packages: write` — uses built-in `GITHUB_TOKEN`, no PAT needed.
+
+### `scripts/deploy.sh`
+One-shot run inside the Codespace (or any Docker host with this repo):
+1. `git pull --ff-only`
+2. assert `.env.prod` exists
+3. `docker compose -f docker-compose.prod.yml up -d --build`
+4. run `migrate` service (idempotent)
+5. `docker compose ps`
+
+### Portfolio story
+- *"CI runs ruff + alembic + pytest on every PR, containers built and pushed to GHCR on main; deploy is a one-command script."*
+- When there's a VPS: add a deploy job using `appleboy/ssh-action` that runs the same `deploy.sh` on the server. ~10 lines.
+
 ## Tests (Phase 16 — core only, not exhaustive)
 `pytest-asyncio 1.3.0` (session-scoped test loop + fixture loop, configured via `pyproject.toml`).
 
@@ -443,6 +473,7 @@ PYTHONPATH=. .venv/Scripts/python.exe scripts/create_api_key.py --name "user" [-
 - [x] 15 Prod stack (Dockerfile + entrypoint + dashboard image + nginx + docker-compose.prod.yml + .env.prod.example)
 - [x] 16 Tests — 17 unit + 4 integration (chat auth+cache path mocked). Locust load test staged for post-deploy.
 - [x] 17 Codespaces deploy (.devcontainer/devcontainer.json — public port 80, single-origin nginx routing, no VPS/TLS/DNS)
+- [x] CI/CD — GH Actions: `ci.yml` (ruff + alembic + pytest + dashboard build) on PR/main; `publish.yml` pushes both images to GHCR on main. `scripts/deploy.sh` pulls + rebuilds in-Codespace.
 - [ ] 15 Nginx + prod Dockerfile + prod compose
 - [ ] 16 Tests
 - [ ] 17 VPS deploy + TLS

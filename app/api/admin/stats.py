@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.middleware import require_admin_key
 from app.db.models import ApiKey, CacheHit, UsageLog
-from app.db.models import ApiKey as ApiKeyModel
 from app.db.session import get_db
 
 router = APIRouter(prefix="/admin", tags=["admin"])

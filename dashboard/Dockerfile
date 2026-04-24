@@ -4,7 +4,9 @@
 FROM node:22-alpine AS builder
 WORKDIR /app
 COPY dashboard/package.json dashboard/package-lock.json ./
-RUN npm ci
+# Use `npm install` (not `npm ci`) so a slightly drifted lockfile still builds.
+# Tradeoff: may mutate the lockfile inside the image layer. Fine for a demo deploy.
+RUN npm install --no-audit --no-fund
 COPY dashboard/ ./
 # Ensure empty VITE_API_BASE_URL so built bundle uses same-origin relative paths,
 # which nginx below proxies to the api service.
