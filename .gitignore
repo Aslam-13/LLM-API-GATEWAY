@@ -40,6 +40,8 @@ htmlcov/
 .tox/
 .mypy_cache/
 .ruff_cache/
+.results/
+
 
 # IDE
 .vscode/

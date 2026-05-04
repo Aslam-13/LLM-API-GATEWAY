@@ -188,6 +188,79 @@ py -3.11 -m venv .venv -> to specify the exact version
   later calls .get() on the task, Celery fetches from Redis.
 
   
+
+    Ways to use the gateway
+
+  1. Direct HTTP calls (curl / any language)
+
+  What you've been doing. Works from anything that speaks HTTP — bash scripts, Postman, shell pipelines, etc.
+
+  2. Drop-in replacement for the OpenAI SDK (the headline feature)
+
+  Since /v1/chat/completions and /v1/embeddings use OpenAI's request/response shape exactly, any OpenAI SDK just works
+  if you point it at your gateway URL.
+
+  Python:
+  from openai import OpenAI
+
+  client = OpenAI(
+      api_key="sk-gw-live-YOUR_KEY",            # your gateway key, not OpenAI's
+      base_url="https://<codespace>-80.app.github.dev/v1",
+  )
+
+  resp = client.chat.completions.create(
+      model="gemini-2.5-flash",                  # or any model your gateway routes
+      messages=[{"role": "user", "content": "Hello"}],
+  )
+  print(resp.choices[0].message.content)
+
+  Zero code change between "talking to OpenAI" and "talking to your gateway." They get caching, semantic matching,
+  Gemini fallback, rate limits, cost tracking — all transparently.
+
+  Node.js:
+  import OpenAI from "openai";
+
+  const client = new OpenAI({
+    apiKey: "sk-gw-live-YOUR_KEY",
+    baseURL: "https://<codespace>-80.app.github.dev/v1",
+  });
+
+  const resp = await client.chat.completions.create({
+    model: "gemini-2.5-flash",
+    messages: [{ role: "user", content: "Hello" }],
+  });
+
+  LangChain:
+  from langchain_openai import ChatOpenAI
+  llm = ChatOpenAI(
+      model="gemini-2.5-flash",
+      api_key="sk-gw-live-YOUR_KEY",
+      base_url="https://<codespace>-80.app.github.dev/v1",
+  )
+
+  LlamaIndex, AutoGPT, CrewAI, Ollama clients — any tool that accepts an OpenAI-compatible endpoint works the same way.
+
+  This is the single biggest selling point. It's how Helicone / Portkey / OpenRouter market themselves.
+
+  3. Dashboard UI
+
+  Observability side. Admin view only — key management, usage charts, cost/cache/latency stats.
+
+  4. Embedded in apps
+
+  Internal web apps, chatbots, content generation pipelines all call /v1/chat/completions directly and get the gateway's
+   value without knowing it exists.
+
+  5. Things not built (but easy to add later)
+
+  - Python SDK — thin wrapper around the HTTP API with typed helpers. Maybe 50 lines.
+  - CLI tool — gwcli chat "hello" / gwcli keys list. Half a day.
+  - Streaming endpoint — listed as v1.5 feature. Enables real-time UIs.
+
+  "Developer tool" framing — yes, use it
+
+
+
 ════════════════════════════════════════════════════════════════════
   MANUAL END-TO-END TEST GUIDE  (Phases 0 → 14 + observability)
   Goal: verify app + db + redis + rabbitmq + worker + dashboard locally.
@@ -344,3 +417,161 @@ Tests                     tests/unit, tests/integration, tests/load
 Whole-project snapshot    preview.md   (read this first next session)
 Phase roadmap             plan.md
 Dashboard roadmap         dashboard/plan.md
+
+
+
+ Run it from your laptop against the live Codespaces URL — that way locust doesn't compete with the gateway for the
+  codespace's CPU.
+
+  Setup (one-time on your laptop)
+
+  You already have locust installed via requirements-dev.txt. Just set environment variables:
+
+  # from your laptop, in the project dir:
+  export GATEWAY_URL=https://<your-codespace-name>-80.app.github.dev
+  export GATEWAY_API_KEY=sk-gw-live-...non-admin-user-key...
+  export GATEWAY_ADMIN_KEY=sk-gw-live-...admin-key...   # optional, enables 10% admin mix
+  export CHAT_MODEL=gemini-2.5-flash-lite
+  export EMBED_MODEL=models/gemini-embedding-001
+  export EMBED_PROVIDER=gemini
+
+  (Use set instead of export on Windows cmd, or $env:GATEWAY_URL=... on PowerShell.)
+
+  Make sure the Codespace is running before launching the test, and test once with a single curl to confirm:
+
+  curl $GATEWAY_URL/health
+
+  Quick start — interactive web UI (recommended for first run)
+
+  .venv/Scripts/locust.exe -f tests/load/locustfile.py --host $GATEWAY_URL
+
+  Open http://localhost:8089 in your browser. Set:
+
+  - Number of users: 5 (start small)
+  - Spawn rate: 1 user/sec
+  - Click "Start swarming"
+
+  You'll see live charts: RPS, response times, failure rate. Click Stop when you've seen enough.
+
+  Headless run with CSV output (for the README numbers)
+
+  .venv/Scripts/locust.exe -f tests/load/locustfile.py \
+    --host $GATEWAY_URL \
+    --users 5 --spawn-rate 1 \
+    --run-time 3m \
+    --headless \
+    --csv results/baseline
+
+  This creates results/baseline_stats.csv, results/baseline_failures.csv, etc. Good for screenshots / numbers in your
+  README's Phase 18 writeup.
+
+  Recommended runs for collecting CV-worthy numbers
+
+  The plan calls for two runs to compare cached vs uncached. Adapted for free-tier limits:
+
+  Run 1 — cache-friendly (default)
+
+  .venv/Scripts/locust.exe -f tests/load/locustfile.py \
+    --host $GATEWAY_URL --users 5 --spawn-rate 1 --run-time 3m \
+    --headless --csv results/with_cache
+
+  Run 2 — bypass exact cache (forces provider every time)
+
+  Quickly flush Redis from the codespace terminal between runs:
+
+  # in codespace terminal
+  docker compose -f docker-compose.prod.yml exec redis redis-cli FLUSHDB
+
+  Then a different prompt pool to avoid semantic-cache hits — easiest hack: change _PROMPTS in locustfile.py to use
+  uniquely-uuid'd prompts per request, OR set SEMANTIC_CACHE_ENABLED=false in .env.prod + restart api+worker to disable
+  both caches.
+
+  .venv/Scripts/locust.exe -f tests/load/locustfile.py \
+    --host $GATEWAY_URL --users 5 --spawn-rate 1 --run-time 3m \
+    --headless --csv results/no_cache
+
+  Compare the two CSVs:
+  - Median + p95 latency on chat completions
+  - Failure rate (429s shouldn't count as failures since the file marks them as success)
+  - Total RPS sustained
+
+  What to watch out for on the free tier
+
+  - Gemini API rate limits kick in fast. gemini-2.5-flash free tier is ~15 req/min. With 5 users hitting at full speed,
+  you'll exhaust it within 30 seconds unless cache absorbs most requests. That's actually fine — it demonstrates exactly
+   what your gateway saves you from.
+  - Codespace CPU. 2 vCPUs handle ~30 RPS comfortably. Beyond that, latency climbs because of resource contention, not
+  because of your gateway logic.
+  - Rate limit (your own). Default is 60/minute per API key. With users=5 doing ~1 req/sec each, you'll be near the
+  limit. Either use --users 3 or temporarily bump RATE_LIMIT_REQUESTS_PER_MINUTE in .env.prod.
+
+  Numbers to extract for the README
+
+  Run, then dig out:
+
+  ┌───────────────────┬────────────────────────────────────────────────────────────────┬────────────────────────────┐
+  │      Metric       │                              From                              │      Use it to claim       │
+  ├───────────────────┼────────────────────────────────────────────────────────────────┼────────────────────────────┤
+  │ Cache hit rate    │ Dashboard /admin/stats/overview after the run                  │ "X% of requests served     │
+  │                   │                                                                │ from cache"                │
+  ├───────────────────┼────────────────────────────────────────────────────────────────┼────────────────────────────┤
+  │ p50 / p95 / p99   │ locust stats CSV                                               │ "p95 < Y ms"               │
+  │ latency           │                                                                │                            │
+  ├───────────────────┼────────────────────────────────────────────────────────────────┼────────────────────────────┤
+  │ Median cached vs  │ UsageLog query: SELECT cache_hit, percentile_cont(0.5) WITHIN  │ "10ms cached vs 1500ms     │
+  │ miss latency      │ GROUP (ORDER BY latency_ms) FROM usage_logs GROUP BY           │ uncached → 150× speedup"   │
+  │                   │ cache_hit;                                                     │                            │
+  ├───────────────────┼────────────────────────────────────────────────────────────────┼────────────────────────────┤
+  │ Cost saved        │ requests_total × avg_cost_uncached − cost_actual               │ "Saved $X on the test run" │
+  ├───────────────────┼────────────────────────────────────────────────────────────────┼────────────────────────────┤
+  │ RPS sustained     │ locust stats CSV                                               │ "Z requests/sec on a       │
+  │                   │                                                                │ 2-vCPU box"                │
+  └───────────────────┴────────────────────────────────────────────────────────────────┴────────────────────────────┘
+
+  Run the dashboard query right after locust finishes:
+
+  docker compose -f docker-compose.prod.yml exec postgres psql -U gateway -d gateway -c "
+    SELECT cache_hit, count(*),
+           round(avg(latency_ms)::numeric, 1) AS avg_ms,
+           round((percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms))::numeric, 1) AS p95_ms
+    FROM usage_logs
+    WHERE created_at > now() - interval '5 minutes'
+    GROUP BY cache_hit;"
+
+  You'll get something like:
+   cache_hit | count |  avg_ms  |  p95_ms
+  -----------+-------+----------+---------
+   none      |   42  | 1437.2   | 2105.0
+   exact     |  118  |    8.4   |   14.0
+   semantic  |   71  |  342.1   |  580.0
+
+  That table is gold for your README. It's the literal proof that the caching layer pays off.
+
+  TL;DR
+
+  # laptop terminal:
+  export GATEWAY_URL=https://<codespace>-80.app.github.dev
+  export GATEWAY_API_KEY=sk-gw-live-...
+  export GATEWAY_ADMIN_KEY=sk-gw-live-...
+
+  .venv/Scripts/locust.exe -f tests/load/locustfile.py \
+    --host $GATEWAY_URL --users 5 --spawn-rate 1 --run-time 3m \
+    --headless --csv results/baseline
+
+  # codespace terminal — pull the comparison query:
+  docker compose -f docker-compose.prod.yml exec postgres psql -U gateway -d gateway \
+    -c "SELECT cache_hit, count(*), avg(latency_ms), percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) FROM
+  usage_logs WHERE created_at > now() - interval '5 minutes' GROUP BY cache_hit;"
+
+  Three minutes of testing, real numbers, ready for the README.
+
+
+  export GATEWAY_URL=https://fantastic-telegram-xqv6977j4vwc6pv4-80.app.github.dev
+  export GATEWAY_API_KEY=sk-gw-live-HfGRF3OrGiAkvlPSeSha33Vqvlv_acMP
+  export GATEWAY_ADMIN_KEY=sk-gw-live-yT3n1zi7IQq2OfJv9D9d2oaEGb-hdu-P
+  export CHAT_MODEL=gemini-2.5-flash-lite
+  export EMBED_MODEL=models/gemini-embedding-001
+  export EMBED_PROVIDER=gemini
+
+
+
